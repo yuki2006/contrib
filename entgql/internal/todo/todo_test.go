@@ -1310,7 +1310,10 @@ func TestNestedConnection(t *testing.T) {
 	groups := ec.Group.CreateBulk(bulkG...).SaveX(ctx)
 	bulkU := make([]*ent.UserCreate, 10)
 	for i := range bulkU {
-		bulkU[i] = ec.User.Create().SetName(fmt.Sprintf("user-%d", i)).AddGroups(groups[:len(groups)-i]...)
+		bulkU[i] = ec.User.Create().
+			SetName(fmt.Sprintf("user-%d", i)).
+			AddGroups(groups[:len(groups)-i]...).
+			SetRequiredMetadata(map[string]any{})
 	}
 	users := ec.User.CreateBulk(bulkU...).SaveX(ctx)
 	users[0].Update().AddFriends(users[1:]...).SaveX(ctx) // user 0 is friends with all
@@ -1319,7 +1322,7 @@ func TestNestedConnection(t *testing.T) {
 	t.Run("After Cursor", func(t *testing.T) {
 		var (
 			query = `query ($id: ID!, $after: Cursor) {
-				 user: node(id: $id) { 
+				 user: node(id: $id) {
 					... on User {
 						id
 						name
@@ -1996,8 +1999,8 @@ func TestMutation_ClearFriend(t *testing.T) {
 	gqlc := client.New(srv)
 
 	ctx := context.Background()
-	user := ec.User.Create().SaveX(ctx)
-	friend := ec.User.Create().AddFriends(user).SaveX(ctx)
+	user := ec.User.Create().SetRequiredMetadata(map[string]any{}).SaveX(ctx)
+	friend := ec.User.Create().SetRequiredMetadata(map[string]any{}).AddFriends(user).SaveX(ctx)
 	friendship := user.QueryFriendships().FirstX(ctx)
 
 	require.True(t, user.QueryFriends().ExistX(ctx))
@@ -2114,7 +2117,7 @@ func TestMultiFieldsOrder(t *testing.T) {
 		      hasNextPage
 		      hasPreviousPage
 		      startCursor
-		      endCursor				
+		      endCursor
 		    }
 		  }
 		}`
@@ -2249,6 +2252,168 @@ func (r *queryRecorder) reset() {
 func (r *queryRecorder) Query(ctx context.Context, query string, args, v interface{}) error {
 	r.queries = append(r.queries, query)
 	return r.Driver.Query(ctx, query, args, v)
+}
+
+func TestReduceQueryComplexity(t *testing.T) {
+	ctx := context.Background()
+	drv, err := sql.Open(dialect.SQLite, fmt.Sprintf("file:%s?mode=memory&cache=shared&_fk=1", t.Name()))
+	require.NoError(t, err)
+	rec := &queryRecorder{Driver: drv}
+	ec := enttest.NewClient(t,
+		enttest.WithOptions(ent.Driver(rec)),
+		enttest.WithMigrateOptions(migrate.WithGlobalUniqueID(true)),
+	)
+	var (
+		// language=GraphQL
+		query = `query Todo($id: ID!) {
+			node(id: $id) {
+				... on Todo {
+					text
+					children (first: 10) {
+						edges {
+							node {
+								text
+							}
+						}
+					}
+				}
+			}
+		}`
+		gqlc = client.New(handler.NewDefaultServer(gen.NewSchema(ec)))
+	)
+	t1 := ec.Todo.Create().SetText("t1").SetStatus(todo.StatusInProgress).SaveX(ctx)
+	rec.reset()
+	require.NoError(t, gqlc.Post(query, new(any), client.Var("id", t1.ID)))
+	require.Equal(t, []string{
+		// Node mapping (cached).
+		"SELECT `type` FROM `ent_types` ORDER BY `id` ASC",
+		// Top-level todo.
+		"SELECT `todos`.`id`, `todos`.`text` FROM `todos` WHERE `todos`.`id` = ? LIMIT 2",
+		// Children todos (without CTE).
+		"SELECT `todos`.`id`, `todos`.`text`, `todos`.`project_todos`, `todos`.`todo_children`, `todos`.`todo_secret` FROM `todos` WHERE `todos`.`todo_children` IN (?) ORDER BY `todos`.`id` LIMIT 11",
+	}, rec.queries)
+
+	// language=GraphQL
+	query = `query Todos($ids: [ID!]!) {
+		todos: nodes (ids: $ids) {
+			... on Todo {
+				text
+				children (first: 10) {
+					edges {
+						node {
+							text
+						}
+					}
+				}
+			}
+		}
+	}`
+	rec.reset()
+	require.NoError(t, gqlc.Post(query, new(any), client.Var("ids", []int{t1.ID})))
+	// A single ID is implemented by the `node` query.
+	require.Equal(t, []string{
+		// Top-level todo.
+		"SELECT `todos`.`id`, `todos`.`text` FROM `todos` WHERE `todos`.`id` = ? LIMIT 2",
+		// Children todos (without CTE).
+		"SELECT `todos`.`id`, `todos`.`text`, `todos`.`project_todos`, `todos`.`todo_children`, `todos`.`todo_secret` FROM `todos` WHERE `todos`.`todo_children` IN (?) ORDER BY `todos`.`id` LIMIT 11",
+	}, rec.queries)
+
+	rec.reset()
+	require.NoError(t, gqlc.Post(query, new(any), client.Var("ids", []int{t1.ID, t1.ID})))
+	require.Equal(t, []string{
+		// Top-level todo.
+		"SELECT `todos`.`id`, `todos`.`text` FROM `todos` WHERE `todos`.`id` IN (?, ?)",
+		// Children todos (with CTE).
+		"WITH `src_query` AS (SELECT `todos`.`id`, `todos`.`text`, `todos`.`project_todos`, `todos`.`todo_children`, `todos`.`todo_secret` FROM `todos` WHERE `todos`.`todo_children` IN (?)), `limited_query` AS (SELECT *, (ROW_NUMBER() OVER (PARTITION BY `todo_children` ORDER BY `id` ASC)) AS `row_number` FROM `src_query`) SELECT `id`, `text`, `project_todos`, `todo_children`, `todo_secret` FROM `limited_query` AS `todos` WHERE `todos`.`row_number` <= ?",
+	}, rec.queries)
+
+	// Propagate uniqueness to one-child edges.
+	// language=GraphQL
+	query = `query Todo($id: ID!) {
+			node(id: $id) {
+				... on Todo {
+					parent {
+						text
+						children (first: 5) {
+							edges {
+								node {
+									text			
+								}
+							}
+						}
+					}
+					category {
+						text
+						todos (first: 10) {
+							edges {
+								node {
+									text					
+								}
+							}
+						}
+					}
+				}
+			}
+		}`
+	ec.Todo.Create().SetText("t0").SetStatus(todo.StatusInProgress).AddChildren(t1).SaveX(ctx)
+	ec.Category.Create().AddTodos(t1).SetText("c0").SetStatus(category.StatusEnabled).SaveX(ctx)
+	rec.reset()
+	require.NoError(t, gqlc.Post(query, new(any), client.Var("id", t1.ID)))
+	require.Equal(t, []string{
+		// Top-level todo.
+		"SELECT `todos`.`id`, `todos`.`category_id`, `todos`.`project_todos`, `todos`.`todo_children`, `todos`.`todo_secret` FROM `todos` WHERE `todos`.`id` = ? LIMIT 2",
+		// Parent todo.
+		"SELECT `todos`.`id`, `todos`.`text` FROM `todos` WHERE `todos`.`id` IN (?)",
+		// Parent children.
+		"SELECT `todos`.`id`, `todos`.`text`, `todos`.`project_todos`, `todos`.`todo_children`, `todos`.`todo_secret` FROM `todos` WHERE `todos`.`todo_children` IN (?) ORDER BY `todos`.`id` LIMIT 6",
+		// Category.
+		"SELECT `categories`.`id`, `categories`.`text` FROM `categories` WHERE `categories`.`id` IN (?)",
+		// Category todos.
+		"SELECT `todos`.`id`, `todos`.`text`, `todos`.`category_id`, `todos`.`project_todos`, `todos`.`todo_children`, `todos`.`todo_secret` FROM `todos` WHERE `todos`.`category_id` IN (?) ORDER BY `todos`.`id` LIMIT 11",
+	}, rec.queries)
+
+	// Same as above, but with multiple IDs.
+	// language=GraphQL
+	query = `query Todo($id: ID!) {
+			nodes(ids: [$id, $id]) {
+				... on Todo {
+					parent {
+						text
+						children (first: 5) {
+							edges {
+								node {
+									text			
+								}
+							}
+						}
+					}
+					category {
+						text
+						todos (first: 10) {
+							edges {
+								node {
+									text					
+								}
+							}
+						}
+					}
+				}
+			}
+		}`
+	rec.reset()
+	require.NoError(t, gqlc.Post(query, new(any), client.Var("id", t1.ID)))
+	require.Equal(t, []string{
+		// Root nodes.
+		"SELECT `todos`.`id`, `todos`.`category_id`, `todos`.`project_todos`, `todos`.`todo_children`, `todos`.`todo_secret` FROM `todos` WHERE `todos`.`id` IN (?, ?)",
+		// Their parents (2 max).
+		"SELECT `todos`.`id`, `todos`.`text` FROM `todos` WHERE `todos`.`id` IN (?)",
+		// 5 children for each parent.
+		"WITH `src_query` AS (SELECT `todos`.`id`, `todos`.`text`, `todos`.`project_todos`, `todos`.`todo_children`, `todos`.`todo_secret` FROM `todos` WHERE `todos`.`todo_children` IN (?)), `limited_query` AS (SELECT *, (ROW_NUMBER() OVER (PARTITION BY `todo_children` ORDER BY `id` ASC)) AS `row_number` FROM `src_query`) SELECT `id`, `text`, `project_todos`, `todo_children`, `todo_secret` FROM `limited_query` AS `todos` WHERE `todos`.`row_number` <= ?",
+		// Category.
+		"SELECT `categories`.`id`, `categories`.`text` FROM `categories` WHERE `categories`.`id` IN (?)",
+		// 10 todos for each category.
+		"WITH `src_query` AS (SELECT `todos`.`id`, `todos`.`text`, `todos`.`category_id`, `todos`.`project_todos`, `todos`.`todo_children`, `todos`.`todo_secret` FROM `todos` WHERE `todos`.`category_id` IN (?)), `limited_query` AS (SELECT *, (ROW_NUMBER() OVER (PARTITION BY `category_id` ORDER BY `id` ASC)) AS `row_number` FROM `src_query`) SELECT `id`, `text`, `category_id`, `project_todos`, `todo_children`, `todo_secret` FROM `limited_query` AS `todos` WHERE `todos`.`row_number` <= ?",
+	}, rec.queries)
 }
 
 func TestFieldSelection(t *testing.T) {
@@ -2731,4 +2896,252 @@ func TestSatisfiesFragments(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, string(ts), rsp.Category.Todos.Edges[i].Node.CreatedAt)
 	}
+}
+
+func TestSatisfiesDeeperFragments(t *testing.T) {
+	ctx := context.Background()
+	ec := enttest.Open(
+		t, dialect.SQLite,
+		fmt.Sprintf("file:%s?mode=memory&cache=shared&_fk=1", t.Name()),
+		enttest.WithMigrateOptions(migrate.WithGlobalUniqueID(true)),
+	)
+	gqlc := client.New(handler.NewDefaultServer(gen.NewSchema(ec)))
+	cat := ec.Category.Create().SetText("cat").SetStatus(category.StatusEnabled).SaveX(ctx)
+	todos := ec.Todo.CreateBulk(
+		ec.Todo.Create().SetText("t1").SetStatus(todo.StatusPending).SetCategory(cat),
+		ec.Todo.Create().SetText("t2").SetStatus(todo.StatusInProgress).SetCategory(cat),
+		ec.Todo.Create().SetText("t3").SetStatus(todo.StatusCompleted).SetCategory(cat),
+	).SaveX(ctx)
+	var (
+		// language=GraphQL
+		query = `query Node($id: ID!) {
+			todo: node(id: $id) {
+				__typename
+				... on Todo {
+					... MainFra
+				}
+				id
+			}
+		}
+
+		fragment MainFra on Todo {
+			...Child1
+			id
+			category {
+				id
+			}
+		}
+
+		fragment Child2 on Category {
+			id
+			text
+		}
+
+		fragment Child1 on Todo {
+			text
+			category {
+				id
+				... Child2
+			}
+		}`
+		rsp struct {
+			Todo struct {
+				TypeName string `json:"__typename"`
+				ID, Text string
+				Category struct {
+					ID, Text string
+				}
+			}
+		}
+	)
+
+	gqlc.MustPost(query, &rsp, client.Var("id", todos[0].ID))
+	require.Equal(t, "cat", cat.Text)
+	require.Equal(t, "cat", rsp.Todo.Category.Text)
+}
+
+func TestRenamedType(t *testing.T) {
+	ctx := context.Background()
+	ec := enttest.Open(
+		t, dialect.SQLite,
+		fmt.Sprintf("file:%s?mode=memory&cache=shared&_fk=1", t.Name()),
+		enttest.WithMigrateOptions(migrate.WithGlobalUniqueID(true)),
+	)
+	gqlc := client.New(handler.NewDefaultServer(gen.NewSchema(ec)))
+	wr := ec.Workspace.Create().SetName("Ariga").SaveX(ctx)
+	var (
+		// language=GraphQL
+		query = `query Node($id: ID!) {
+			text: node(id: $id) {
+				id
+				... on Organization {
+					name
+				}
+			}
+		}`
+		rsp struct {
+			Text struct {
+				ID, Name string
+			}
+		}
+	)
+	gqlc.MustPost(query, &rsp, client.Var("id", wr.ID))
+	require.Equal(t, "Ariga", rsp.Text.Name)
+}
+
+func TestSatisfiesNodeFragments(t *testing.T) {
+	ctx := context.Background()
+	ec := enttest.Open(
+		t, dialect.SQLite,
+		fmt.Sprintf("file:%s?mode=memory&cache=shared&_fk=1", t.Name()),
+		enttest.WithMigrateOptions(migrate.WithGlobalUniqueID(true)),
+	)
+	gqlc := client.New(handler.NewDefaultServer(gen.NewSchema(ec)))
+	t1 := ec.Todo.Create().SetText("t1").SetStatus(todo.StatusPending).SaveX(ctx)
+	var (
+		// language=GraphQL
+		query = `query Node($id: ID!) {
+			todo: node(id: $id) {
+				id
+				...NodeFragment
+			}
+		}
+		fragment NodeFragment on Node {
+			... on Todo {
+				createdAt
+				status
+				text
+			}
+		}`
+		rsp struct {
+			Todo struct {
+				ID, Text, CreatedAt string
+				Status              todo.Status
+			}
+		}
+	)
+	gqlc.MustPost(query, &rsp, client.Var("id", t1.ID))
+	require.Equal(t, strconv.Itoa(t1.ID), rsp.Todo.ID)
+	require.Equal(t, "t1", rsp.Todo.Text)
+	require.NotEmpty(t, rsp.Todo.Status)
+	require.NotEmpty(t, rsp.Todo.CreatedAt)
+
+	g1 := ec.Group.Create().SetName("g1").SaveX(ctx)
+	var (
+		// language=GraphQL
+		query1 = `query Node($id: ID!) {
+			group: node(id: $id) {
+				id
+				...NamedNodeFragment
+			}
+		}
+		fragment NamedNodeFragment on NamedNode {
+			... on Group {
+				name
+			}
+		}`
+		rsp1 struct {
+			Group struct {
+				ID, Name string
+			}
+		}
+	)
+	gqlc.MustPost(query1, &rsp1, client.Var("id", g1.ID))
+	require.Equal(t, strconv.Itoa(g1.ID), rsp1.Group.ID)
+	require.Equal(t, "g1", rsp1.Group.Name)
+}
+
+func TestPaginate(t *testing.T) {
+	ctx := context.Background()
+	ec := enttest.Open(
+		t, dialect.SQLite,
+		fmt.Sprintf("file:%s?mode=memory&cache=shared&_fk=1", t.Name()),
+		enttest.WithMigrateOptions(migrate.WithGlobalUniqueID(true)),
+	)
+	first := 1
+	// Ensure that the pagination query compiles.
+	_, err := ec.Todo.Query().
+		Select(todo.FieldPriority, todo.FieldStatus).
+		Paginate(ctx, nil, &first, nil, nil)
+	require.NoError(t, err)
+}
+
+func TestPrivateFieldSelectionForPagination(t *testing.T) {
+	ctx := context.Background()
+	drv, err := sql.Open(dialect.SQLite, fmt.Sprintf("file:%s?mode=memory&cache=shared&_fk=1", t.Name()))
+	require.NoError(t, err)
+	rec := &queryRecorder{Driver: drv}
+	ec := enttest.NewClient(t,
+		enttest.WithOptions(ent.Driver(rec)),
+		enttest.WithMigrateOptions(migrate.WithGlobalUniqueID(true)),
+	)
+	ec.Todo.CreateBulk(
+		ec.Todo.Create().SetText("t0.1").SetStatus(todo.StatusInProgress),
+		ec.Todo.Create().SetText("t0.2").SetStatus(todo.StatusInProgress),
+		ec.Todo.Create().SetText("t0.3").SetStatus(todo.StatusCompleted),
+		ec.Todo.Create().SetText("t0.4").SetStatus(todo.StatusCompleted),
+		ec.Todo.Create().SetText("t0.5").SetStatus(todo.StatusCompleted),
+	).SaveX(ctx)
+
+	var (
+		// language=GraphQL
+		query = `query {
+			todosWithJoins(first: 2, orderBy: [{direction: DESC, field: STATUS}]) {
+				edges {
+					cursor
+					node {
+						text
+					}
+				}
+			}
+		}`
+		rsp struct {
+			TodosWithJoins struct {
+				Edges []struct {
+					Cursor string
+					Node   struct {
+						Text string
+					}
+				}
+			}
+		}
+		gqlc = client.New(handler.NewDefaultServer(gen.NewSchema(ec)))
+	)
+	rec.reset()
+	gqlc.MustPost(query, &rsp)
+	require.Equal(t, []string{
+		"SELECT `todos`.`id`, `todos`.`text`, `todos`.`status` FROM `todos` LEFT JOIN `categories` AS `t1` ON `todos`.`category_id` = `t1`.`id` GROUP BY `todos`.`id` ORDER BY `todos`.`status` DESC, `todos`.`id` LIMIT 3",
+	}, rec.queries)
+
+	t.Log(rsp.TodosWithJoins)
+
+	var (
+		// language=GraphQL
+		query2 = `query {
+			todosWithJoins(first: 2, after: "gqFp0wAAAAYAAAACoXaRq0lOX1BST0dSRVNT", orderBy: [{direction: DESC, field: STATUS}]) {
+				edges {
+					cursor
+					node {
+						text
+					}
+				}
+			}
+		}`
+		rsp2 struct {
+			TodosWithJoins struct {
+				Edges []struct {
+					Cursor string
+					Node   struct {
+						Text string
+					}
+				}
+			}
+		}
+	)
+	rec.reset()
+	gqlc.MustPost(query2, &rsp2)
+	require.Equal(t, []string{
+		// BEFORE: "SELECT `todos`.`id`, `todos`.`text`, `todos`.`status` FROM `todos` LEFT JOIN `categories` AS `t1` ON `todos`.`category_id` = `t1`.`id` WHERE `status` < ? OR (`status` = ? AND `id` > ?) GROUP BY `todos`.`id` ORDER BY `todos`.`status` DESC, `todos`.`id` LIMIT 3",
+		"SELECT `todos`.`id`, `todos`.`text`, `todos`.`status` FROM `todos` LEFT JOIN `categories` AS `t1` ON `todos`.`category_id` = `t1`.`id` WHERE `todos`.`status` < ? OR (`todos`.`status` = ? AND `todos`.`id` > ?) GROUP BY `todos`.`id` ORDER BY `todos`.`status` DESC, `todos`.`id` LIMIT 3",
+	}, rec.queries)
 }
