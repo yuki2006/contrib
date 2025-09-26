@@ -222,12 +222,12 @@ func multiPredicate[T any](cursor *Cursor[T], opts *MultiCursorsOptions) (func(*
 		for i := range opts.Fields {
 			var ands []*sql.Predicate
 			for j := 0; j < i; j++ {
-				ands = append(ands, sql.EQ(s.C(opts.Fields[j]), values[j]))
+				ands = append(ands, sql.EQNull(s.C(opts.Fields[j]), values[j]))
 			}
 			if opts.Directions[i] == OrderDirectionAsc {
-				ands = append(ands, sql.GT(s.C(opts.Fields[i]), values[i]))
+				ands = append(ands, sql.GTNull(s.C(opts.Fields[i]), values[i]))
 			} else {
-				ands = append(ands, sql.LT(s.C(opts.Fields[i]), values[i]))
+				ands = append(ands, sql.LTNull(s.C(opts.Fields[i]), values[i]))
 			}
 			or = append(or, sql.And(ands...))
 		}

@@ -3,7 +3,7 @@ module entgo.io/contrib
 go 1.23.4
 
 require (
-	entgo.io/ent v0.14.4
+	entgo.io/ent v0.14.5
 	github.com/99designs/gqlgen v0.17.68
 	github.com/AlekSi/pointer v1.1.0
 	github.com/alecthomas/kong v0.7.0
@@ -28,6 +28,8 @@ require (
 	google.golang.org/grpc v1.52.3
 	google.golang.org/protobuf v1.36.5
 )
+
+replace entgo.io/ent v0.14.5 => github.com/yuki2006/ent v0.14.2-0.20240917055102-3832e58931e3
 
 require github.com/golang/protobuf v1.5.4 // indirect
 
