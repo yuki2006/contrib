@@ -1,6 +1,6 @@
 module entgo.io/contrib
 
-go 1.23
+go 1.23.0
 
 toolchain go1.24.1
 
@@ -30,12 +30,14 @@ require (
 	google.golang.org/protobuf v1.34.2
 )
 
+replace entgo.io/ent v0.14.5 => github.com/yuki2006/ent v0.14.2-0.20240917055102-3832e58931e3
+
 require (
 	ariga.io/atlas v0.32.1-0.20250325101103-175b25e1c1b9 // indirect
 	github.com/agext/levenshtein v1.2.3 // indirect
 	github.com/agnivade/levenshtein v1.1.1 // indirect
-	github.com/apparentlymart/go-textseg/v13 v13.0.0 // indirect
 	github.com/apparentlymart/go-textseg/v15 v15.0.0 // indirect
+	github.com/bmatcuk/doublestar v1.3.4 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dlclark/regexp2 v1.7.0 // indirect
 	github.com/fatih/color v1.13.0 // indirect
@@ -43,7 +45,6 @@ require (
 	github.com/go-faster/errors v0.6.1 // indirect
 	github.com/go-faster/jx v0.40.0 // indirect
 	github.com/go-faster/yamlx v0.4.1 // indirect
-	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/gorilla/websocket v1.5.0 // indirect
@@ -60,6 +61,7 @@ require (
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/zclconf/go-cty v1.14.4 // indirect
+	github.com/zclconf/go-cty-yaml v1.1.0 // indirect
 	go.uber.org/atomic v1.10.0 // indirect
 	golang.org/x/mod v0.23.0 // indirect
 	golang.org/x/net v0.35.0 // indirect
