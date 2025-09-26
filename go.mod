@@ -8,7 +8,7 @@ require (
 	github.com/AlekSi/pointer v1.1.0
 	github.com/alecthomas/kong v0.7.0
 	github.com/go-openapi/inflect v0.19.0
-	github.com/go-viper/mapstructure/v2 v2.2.1
+	github.com/go-viper/mapstructure/v2 v2.4.0
 	github.com/google/addlicense v1.1.1
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/go-multierror v1.1.1
